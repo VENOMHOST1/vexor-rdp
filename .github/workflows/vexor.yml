@@ -1,0 +1,447 @@
+name: VEXOR Win11
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain_id:
+        required: false
+        default: 'vexor-main-1'
+      auto_restart:
+        required: false
+        default: 'true'
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Free Disk
+        shell: pwsh
+        run: |
+          Start-Job { Remove-Item -Recurse -Force "C:\hostedtoolcache" -EA SilentlyContinue } | Out-Null
+          Write-Output "[+] Free: $([Math]::Round((Get-PSDrive C).Free/1GB,1))GB"
+
+      - name: Configure 16GB RAM
+        shell: pwsh
+        run: |
+          try {
+            Set-CimInstance -Query "Select * from Win32_ComputerSystem" `
+              -Property @{AutomaticManagedPagefile=$false} -EA SilentlyContinue
+            Set-ItemProperty `
+              'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' `
+              -Name PagingFiles -Value "C:\pagefile.sys 16384 16384" -EA SilentlyContinue
+            Write-Output "[+] Pagefile 16GB set"
+          } catch { Write-Output "[!] $_" }
+
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" UserAuthentication 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" SecurityLayer 1
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" fPromptForPassword 0
+          New-Item "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -EA SilentlyContinue | Out-Null
+          Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" fDisableUDP 1 -EA SilentlyContinue
+          Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" LmCompatibilityLevel 2 -EA SilentlyContinue
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -EA SilentlyContinue
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          for ($i=0; $i -lt 20; $i++) {
+            if ((Test-NetConnection 127.0.0.1 -Port 3389 -WA SilentlyContinue).TcpTestSucceeded) {
+              Write-Output "[+] RDP ready"; break
+            }
+            Start-Sleep 2
+          }
+
+      - name: Create VEXOR User
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\sp.cfg
+          (Get-Content C:\sp.cfg) `
+            -replace "PasswordComplexity = 1","PasswordComplexity = 0" `
+            -replace "MinimumPasswordLength = 8","MinimumPasswordLength = 0" |
+            Set-Content C:\sp.cfg
+          secedit /configure /db C:\windows\security\local.sdb /cfg C:\sp.cfg /areas SECURITYPOLICY
+          Remove-Item C:\sp.cfg -EA SilentlyContinue
+          net user VEXOR VEXOR@2026 /add /expires:never /active:yes
+          net localgroup Administrators VEXOR /add
+          net localgroup "Remote Desktop Users" VEXOR /add
+          net user runneradmin VEXOR@2026 /active:yes
+          New-Item -ItemType Directory -Force "C:\Users\VEXOR\.config\vexor" | Out-Null
+          New-Item -ItemType Directory -Force "C:\logs" | Out-Null
+          Write-Output "[+] VEXOR / VEXOR@2026"
+
+      - name: Baseline + Delta Restore
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $chainId = "${{ inputs.chain_id }}".Trim()
+          $vpsUrl  = "http://191.215.42.79:8765/backup/$chainId?secret=gitube_delta_2026"
+
+          function Get-Names($p) {
+            if (Test-Path $p) { return @(Get-ChildItem $p -Force -EA SilentlyContinue | Select-Object -ExpandProperty Name) }
+            return @()
+          }
+
+          $baseline = @{
+            ProgramFiles     = Get-Names "C:\Program Files"
+            ProgramFilesX86  = Get-Names "C:\Program Files (x86)"
+            AppDataLocalProg = Get-Names "C:\Users\VEXOR\AppData\Local\Programs"
+            AppDataRoaming   = Get-Names "C:\Users\VEXOR\AppData\Roaming"
+            VEXORDesktop     = Get-Names "C:\Users\VEXOR\Desktop"
+            PublicDesktop    = Get-Names "C:\Users\Public\Desktop"
+            VEXORDownloads   = Get-Names "C:\Users\VEXOR\Downloads"
+            VEXORDocuments   = Get-Names "C:\Users\VEXOR\Documents"
+          }
+          $baseline | ConvertTo-Json -Depth 4 | Set-Content "C:\rdp_baseline.json" -Encoding UTF8
+          Write-Output "[+] Baseline recorded"
+
+          if (-not $chainId) { Write-Output "[*] No chain_id — fresh start"; exit 0 }
+
+          Write-Output "[*] Fetching delta (chain: $chainId)..."
+          try {
+            Invoke-WebRequest -Uri $vpsUrl -Method Get -OutFile "C:\delta_in.zip" -TimeoutSec 120 -EA Stop
+            if ((Test-Path "C:\delta_in.zip") -and (Get-Item "C:\delta_in.zip").Length -gt 100) {
+              $sizeMB = [Math]::Round((Get-Item "C:\delta_in.zip").Length/1MB,1)
+              Write-Output "[+] Delta $sizeMB MB — restoring..."
+              Expand-Archive "C:\delta_in.zip" "C:\delta_stage" -Force
+
+              $map = @{
+                "ProgramFiles"     = "C:\Program Files"
+                "ProgramFilesX86"  = "C:\Program Files (x86)"
+                "AppDataLocalProg" = "C:\Users\VEXOR\AppData\Local\Programs"
+                "AppDataRoaming"   = "C:\Users\VEXOR\AppData\Roaming"
+                "VEXORDesktop"     = "C:\Users\VEXOR\Desktop"
+                "PublicDesktop"    = "C:\Users\Public\Desktop"
+                "VEXORDownloads"   = "C:\Users\VEXOR\Downloads"
+                "VEXORDocuments"   = "C:\Users\VEXOR\Documents"
+                "VEXORConfig"      = "C:\Users\VEXOR\.config\vexor"
+                "Chrome"           = "C:\Users\VEXOR\AppData\Roaming\Google\Chrome\User Data\Default"
+                "Edge"             = "C:\Users\VEXOR\AppData\Local\Microsoft\Edge\User Data\Default"
+              }
+              foreach ($k in $map.Keys) {
+                $src = "C:\delta_stage\$k"
+                $dst = $map[$k]
+                if (-not (Test-Path $src)) { continue }
+                if (-not (Test-Path $dst)) { New-Item -ItemType Directory $dst -Force | Out-Null }
+                robocopy "$src" "$dst" /E /B /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS 2>&1 | Out-Null
+              }
+
+              $ntuserSrc = "C:\delta_stage\NTUSER\NTUSER.DAT"
+              if (Test-Path $ntuserSrc) {
+                Copy-Item $ntuserSrc "C:\Users\VEXOR\NTUSER.DAT" -Force
+                try {
+                  $sid  = (New-Object System.Security.Principal.NTAccount("VEXOR")).Translate(
+                            [System.Security.Principal.SecurityIdentifier]).Value
+                  $pKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+                  if (-not (Test-Path $pKey)) { New-Item $pKey -Force | Out-Null }
+                  Set-ItemProperty $pKey "ProfileImagePath" "C:\Users\VEXOR" -Type ExpandString -Force
+                  Set-ItemProperty $pKey "State"    0 -Type DWord -Force
+                  Set-ItemProperty $pKey "RefCount" 1 -Type DWord -Force
+                  Write-Output "[+] NTUSER.DAT profile registered"
+                } catch { Write-Output "[!] Profile register: $_ (non-fatal)" }
+              }
+
+              if (Test-Path "C:\delta_stage\user_apps.reg") {
+                reg import "C:\delta_stage\user_apps.reg" 2>$null
+              }
+
+              Remove-Item "C:\delta_in.zip","C:\delta_stage" -Recurse -Force -EA SilentlyContinue
+              Write-Output "[+] Delta restored OK"
+              try { Invoke-RestMethod -Uri $vpsUrl -Method Delete -TimeoutSec 30 -EA SilentlyContinue | Out-Null } catch {}
+            } else {
+              Write-Output "[*] No delta — fresh start"
+              Remove-Item "C:\delta_in.zip" -Force -EA SilentlyContinue
+            }
+          } catch { Write-Output "[*] No delta: $_" }
+
+      - name: Download bore
+        shell: pwsh
+        run: |
+          $urls = @(
+            "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/ekzhang/bore/releases/download/v0.4.0/bore-v0.4.0-x86_64-pc-windows-msvc.zip"
+          )
+          $ok = $false
+          foreach ($url in $urls) {
+            try { Invoke-WebRequest $url -OutFile "C:\bore.zip" -UseBasicParsing -TimeoutSec 120 -EA Stop; $ok=$true; break }
+            catch { Write-Output "[!] Failed: $url" }
+          }
+          if (-not $ok) { Write-Output "[!] bore download failed"; exit 1 }
+          Expand-Archive "C:\bore.zip" "C:\bore_bin" -Force
+          $exe = Get-ChildItem "C:\bore_bin" -Filter "bore.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { Write-Output "[!] bore.exe not found"; exit 1 }
+          Copy-Item $exe.FullName "C:\bore.exe"
+          Write-Output "[+] bore ready"
+
+      - name: Start bore + TG Notify
+        id: tunnel
+        shell: pwsh
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHATS: ${{ secrets.TG_CHATS }}
+        run: |
+          function Send-TG($msg) {
+            foreach ($id in ($env:TG_CHATS -split ",")) {
+              $id = $id.Trim(); if (-not $id) { continue }
+              try { Invoke-RestMethod "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage?chat_id=$id&text=$msg" -EA Stop | Out-Null }
+              catch { Write-Output "[!] TG: $_" }
+            }
+          }
+
+          function Start-BoreInstance($log, $err) {
+            Remove-Item $log,$err -Force -EA SilentlyContinue
+            $p = Start-Process "C:\bore.exe" `
+              -ArgumentList "local","3389","--to","bore.pub" `
+              -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError  $err
+            for ($i=0; $i -lt 15; $i++) {
+              Start-Sleep 2
+              if ($p.HasExited) {
+                Write-Output "[!] bore exited (code $($p.ExitCode))"
+                Get-Content $err -EA SilentlyContinue
+                return $null
+              }
+              $txt = Get-Content $log -EA SilentlyContinue | Out-String
+              if ($txt -match "listening at bore\.pub:(\d+)") {
+                Write-Output "[+] bore.pub:$($Matches[1])"
+                return $p
+              }
+            }
+            Write-Output "[!] bore timeout"
+            return $null
+          }
+
+          function Get-BorePort($log) {
+            $txt = Get-Content $log -EA SilentlyContinue | Out-String
+            if ($txt -match "listening at bore\.pub:(\d+)") { return "bore.pub:$($Matches[1])" }
+            return $null
+          }
+
+          $proc = Start-BoreInstance "C:\bore.log" "C:\bore_err.log"
+          if (-not $proc) { exit 1 }
+
+          $boreHost = Get-BorePort "C:\bore.log"
+          if (-not $boreHost) { Write-Output "[!] No bore port"; exit 1 }
+
+          Write-Output "[+] Tunnel: $boreHost"
+          $msg = "VEXOR+RDP+Ready%0A%F0%9F%96%A5+$boreHost%0A%F0%9F%91%A4+VEXOR%0A%F0%9F%94%91+VEXOR%402026"
+          Send-TG $msg
+
+          echo "BORE_HOST=$boreHost"      >> $env:GITHUB_ENV
+          echo "bore_pid=$($proc.Id)"     >> $env:GITHUB_OUTPUT
+
+      - name: Watchdog + Keep Alive
+        shell: pwsh
+        env:
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          GH_TOKEN:     ${{ secrets.GH_PAT }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          TG_TOKEN:     ${{ secrets.TG_TOKEN }}
+          TG_CHATS:     ${{ secrets.TG_CHATS }}
+          BORE_PID:     ${{ steps.tunnel.outputs.bore_pid }}
+        run: |
+          $start     = Get-Date
+          $triggered = $false
+          $borePid   = [int]$env:BORE_PID
+          $boreLog   = "C:\bore.log"
+          $restartN  = 0
+          $apiHdrs   = @{ "Authorization"="token $env:GH_TOKEN"; "Accept"="application/vnd.github.v3+json" }
+
+          function Send-TG($msg) {
+            foreach ($id in ($env:TG_CHATS -split ",")) {
+              $id = $id.Trim(); if (-not $id) { continue }
+              try { Invoke-RestMethod "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage?chat_id=$id&text=$msg" -EA Stop | Out-Null }
+              catch {}
+            }
+          }
+
+          function Start-BoreInstance($log, $err) {
+            Remove-Item $log,$err -Force -EA SilentlyContinue
+            $p = Start-Process "C:\bore.exe" `
+              -ArgumentList "local","3389","--to","bore.pub" `
+              -WindowStyle Hidden -PassThru `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError  $err
+            for ($i=0; $i -lt 15; $i++) {
+              Start-Sleep 2
+              if ($p.HasExited) { return $null }
+              $txt = Get-Content $log -EA SilentlyContinue | Out-String
+              if ($txt -match "listening at bore\.pub:(\d+)") { return $p }
+            }
+            return $null
+          }
+
+          function Get-BorePort($log) {
+            $txt = Get-Content $log -EA SilentlyContinue | Out-String
+            if ($txt -match "listening at bore\.pub:(\d+)") { return "bore.pub:$($Matches[1])" }
+            return $null
+          }
+
+          function Save-Delta {
+            Write-Output "[*] Saving delta to VPS..."
+            $chainId = $env:CHAIN_ID
+            $vpsUrl  = "http://191.215.42.79:8765/backup/$chainId?secret=gitube_delta_2026"
+
+            $qOut = query session 2>&1 | Out-String
+            foreach ($line in ($qOut -split "`n" | Where-Object { $_ -match "VEXOR" })) {
+              if ($line -match '\s+(\d+)\s+(Active|Disc)') {
+                Write-Output "[*] Logging off VEXOR session $($Matches[1])"
+                logoff $Matches[1] 2>&1 | Out-Null
+              }
+            }
+            Start-Sleep 20
+
+            Stop-Process -Name chrome,msedge,firefox -Force -EA SilentlyContinue
+            Start-Sleep 3
+
+            if (-not (Test-Path "C:\rdp_baseline.json")) {
+              Write-Output "[!] No baseline — skipping delta"; return
+            }
+
+            $base  = Get-Content "C:\rdp_baseline.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+            $stage = "C:\delta_export"
+            $zip   = "C:\delta_out.zip"
+            Remove-Item $stage,$zip -Recurse -Force -EA SilentlyContinue
+            New-Item -ItemType Directory $stage -Force | Out-Null
+
+            if (Test-Path "C:\Users\VEXOR\NTUSER.DAT") {
+              New-Item -ItemType Directory "$stage\NTUSER" -Force | Out-Null
+              Copy-Item "C:\Users\VEXOR\NTUSER.DAT" "$stage\NTUSER\NTUSER.DAT" -Force
+              $sz = [Math]::Round((Get-Item "$stage\NTUSER\NTUSER.DAT").Length/1MB,2)
+              Write-Output "[+] NTUSER.DAT ($sz MB)"
+            }
+
+            $targets = @(
+              @{ Key="ProgramFiles";     Path="C:\Program Files" }
+              @{ Key="ProgramFilesX86";  Path="C:\Program Files (x86)" }
+              @{ Key="AppDataLocalProg"; Path="C:\Users\VEXOR\AppData\Local\Programs" }
+              @{ Key="AppDataRoaming";   Path="C:\Users\VEXOR\AppData\Roaming" }
+              @{ Key="VEXORDesktop";     Path="C:\Users\VEXOR\Desktop" }
+              @{ Key="PublicDesktop";    Path="C:\Users\Public\Desktop" }
+              @{ Key="VEXORDownloads";   Path="C:\Users\VEXOR\Downloads" }
+              @{ Key="VEXORDocuments";   Path="C:\Users\VEXOR\Documents" }
+            )
+
+            foreach ($t in $targets) {
+              if (-not (Test-Path $t.Path)) { continue }
+              $origList = @($base.($t.Key))
+              foreach ($item in (Get-ChildItem $t.Path -Force -EA SilentlyContinue)) {
+                if ($origList -notcontains $item.Name) {
+                  $destSub = "$stage\$($t.Key)"
+                  if (-not (Test-Path $destSub)) { New-Item -ItemType Directory $destSub -Force | Out-Null }
+                  Copy-Item $item.FullName "$destSub\$($item.Name)" -Recurse -Force -EA SilentlyContinue
+                }
+              }
+            }
+
+            $src = "C:\Users\VEXOR\.config\vexor"
+            if (Test-Path $src) {
+              New-Item -ItemType Directory "$stage\VEXORConfig" -Force | Out-Null
+              robocopy "$src" "$stage\VEXORConfig" /E /B /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS 2>&1 | Out-Null
+            }
+
+            $chromeSrc = "C:\Users\VEXOR\AppData\Roaming\Google\Chrome\User Data\Default"
+            if (Test-Path $chromeSrc) {
+              New-Item -ItemType Directory "$stage\Chrome" -Force | Out-Null
+              robocopy "$chromeSrc" "$stage\Chrome" /E /B /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS `
+                /XD "Cache" "Code Cache" "GPUCache" "Service Worker" "CacheStorage" 2>&1 | Out-Null
+            }
+
+            $edgeSrc = "C:\Users\VEXOR\AppData\Local\Microsoft\Edge\User Data\Default"
+            if (Test-Path $edgeSrc) {
+              New-Item -ItemType Directory "$stage\Edge" -Force | Out-Null
+              robocopy "$edgeSrc" "$stage\Edge" /E /B /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS `
+                /XD "Cache" "Code Cache" "GPUCache" "Service Worker" "CacheStorage" 2>&1 | Out-Null
+            }
+
+            Compress-Archive -Path "$stage\*" -DestinationPath $zip -CompressionLevel Fastest -Force
+            $sizeMB = [Math]::Round((Get-Item $zip).Length/1MB,1)
+            Write-Output "[*] Archive $sizeMB MB — uploading to VPS..."
+
+            try {
+              Invoke-RestMethod -Uri $vpsUrl -Method Post -InFile $zip `
+                -ContentType "application/octet-stream" -TimeoutSec 180 | Out-Null
+              Write-Output "[+] Delta saved ($sizeMB MB)"
+            } catch { Write-Output "[!] Delta upload failed: $_" }
+
+            Remove-Item $stage,$zip -Recurse -Force -EA SilentlyContinue
+          }
+
+          while ($true) {
+            $elapsed = ((Get-Date) - $start).TotalMinutes
+
+            $boreAlive = $borePid -gt 0 -and [bool](Get-Process -Id $borePid -EA SilentlyContinue)
+            if (-not $boreAlive) {
+              $restartN++
+              Write-Output "[!] bore dead — restart #$restartN"
+              $newLog = "C:\bore_r$restartN.log"
+              $newErr = "C:\bore_r${restartN}_err.log"
+              $p = Start-BoreInstance $newLog $newErr
+              if ($p) {
+                $borePid = $p.Id; $boreLog = $newLog
+                $url = Get-BorePort $boreLog
+                if ($url) {
+                  $env:BORE_HOST = $url
+                  $msg = "VEXOR+restarted+%23$restartN%0A%F0%9F%96%A5+$url%0A%F0%9F%91%A4+VEXOR%0A%F0%9F%94%91+VEXOR%402026"
+                  Send-TG $msg
+                  Write-Output "[+] bore up: $url"
+                }
+              } else {
+                Write-Output "[!] bore restart failed"
+                $borePid = 0; Start-Sleep 30
+              }
+            }
+
+            if ($elapsed -ge 350 -and -not $triggered -and $env:AUTO_RESTART -eq "true") {
+              Send-TG "VEXOR%3A+saving+%26+restarting..."
+              Save-Delta
+              $body = @{ ref=$env:GH_REF; inputs=@{ chain_id=$env:CHAIN_ID; auto_restart="true" } } | ConvertTo-Json -Depth 3
+              try {
+                Invoke-RestMethod "https://api.github.com/repos/$env:GH_REPO/actions/workflows/vexor.yml/dispatches" `
+                  -Method Post -Headers $apiHdrs -Body $body -ContentType "application/json" -EA Stop
+                Write-Output "[+] Next session triggered!"
+                $triggered = $true; break
+              } catch { Write-Output "[!] Trigger failed: $_" }
+            }
+
+            Write-Output "[~] $([Math]::Round($elapsed,1))m | pid=$borePid | $env:BORE_HOST"
+            Start-Sleep 120
+          }
+
+      - name: Fallback Trigger
+        if: always()
+        shell: pwsh
+        env:
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          CHAIN_ID:     ${{ inputs.chain_id }}
+          GH_TOKEN:     ${{ secrets.GH_PAT }}
+          GH_REPO:      ${{ github.repository }}
+          GH_REF:       ${{ github.ref_name }}
+          TG_TOKEN:     ${{ secrets.TG_TOKEN }}
+          TG_CHATS:     ${{ secrets.TG_CHATS }}
+        run: |
+          if ($env:AUTO_RESTART -eq "true") {
+            $body = @{ ref=$env:GH_REF; inputs=@{ chain_id=$env:CHAIN_ID; auto_restart="true" } } | ConvertTo-Json -Depth 3
+            try {
+              Invoke-RestMethod "https://api.github.com/repos/$env:GH_REPO/actions/workflows/vexor.yml/dispatches" `
+                -Method Post `
+                -Headers @{ "Authorization"="token $env:GH_TOKEN"; "Accept"="application/vnd.github.v3+json" } `
+                -Body $body -ContentType "application/json" -EA SilentlyContinue | Out-Null
+              Write-Output "[+] Fallback trigger sent"
+            } catch {}
+          }
+          foreach ($id in ($env:TG_CHATS -split ",")) {
+            $id = $id.Trim(); if (-not $id) { continue }
+            try {
+              Invoke-RestMethod "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage?chat_id=$id&text=VEXOR%3A+session+ended+%E2%9A%A0%EF%B8%8F+restarting..." -EA SilentlyContinue | Out-Null
+            } catch {}
+          }
